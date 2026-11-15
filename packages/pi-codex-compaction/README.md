@@ -68,6 +68,18 @@ Targets **Pi 1.5.2**. The package name is unchanged, but the legacy
 pi install npm:pi-codex-compaction
 ```
 
+For this fork's one-shot-compaction branch, install through Git instead of npm
+or a local development path:
+
+```bash
+pi install git:github.com/TallMessiWu/pi-mono@feat/server-compaction-now
+```
+
+The fork's root manifest loads only this extension. Remove an existing npm/local
+installation first to avoid duplicate commands. Pi manages its own checkout;
+a separate development clone is not the runtime source. Push branch changes,
+then run `pi update --extensions` and `/reload` to load updates.
+
 For local development:
 
 ```bash

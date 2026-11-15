@@ -4,6 +4,24 @@ Packages that make [Pi](https://pi.dev) better at sustained engineering work: st
 
 Each package installs independently. Pick the capability you need, then follow its linked README for setup and usage.
 
+## Install this fork's compaction branch
+
+This fork exposes **only pi-codex-compaction** from the repository root for Pi Git
+installs. It does not enable the other workspace extensions, skills, prompts, or
+themes.
+
+```bash
+pi install git:github.com/TallMessiWu/pi-mono@feat/server-compaction-now
+```
+
+Remove any existing npm or local-path installation of pi-codex-compaction first
+so the extension is not loaded twice. Run `/reload` in an existing Pi session,
+then use `/server-compaction now` before sending your next message normally.
+
+Pi manages its own checkout of the named branch under its Git package directory.
+A separate development clone is not used at runtime: push changes to the branch,
+then run `pi update --extensions` and `/reload` to use them.
+
 ## Find a package
 
 ### Build and manage work
