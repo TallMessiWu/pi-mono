@@ -6,6 +6,11 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ## [Unreleased]
 
+### Added
+
+- Add `/server-compaction now` to queue a temporary 1,000-token threshold for the next eligible ordinary request without sending an extra message or invoking Pi's summarizer. Preserve the original automatic mode and threshold for all subsequent requests, including tool continuations, failures, cancellations, and reloads.
+- Persist branch-local pending/consumed state, show pending one-shots in `status`, and let explicit `on`/`off` cancel them. Cover original settings, checkpoint replay, reload/navigation, skipped requests, failures, cancellations, and the packed extension in print/JSON/RPC modes.
+
 ## [0.2.6] - 2026-11-12
 
 ### Fixed

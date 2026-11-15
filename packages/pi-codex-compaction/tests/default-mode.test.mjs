@@ -43,7 +43,7 @@ function fixture(modelChanges = {}, flagOverride, thresholdOverride) {
   dispatch("session_start");
   dispatch("turn_start");
   return {
-    flags, commands, handlers, ctx, notices, authCalls: () => authCalls,
+    flags, commands, handlers, entries, dispatch, ctx, notices, authCalls: () => authCalls,
     payload: () => ({ model: ctx.model.id, input: [] }),
     request: (payload) => dispatch("before_provider_request", { payload }),
     warm: () => dispatch("cache_warming_decision", { action: "warm" }),
@@ -191,6 +191,87 @@ test("model switches do not carry an automatic warming veto to another provider"
   h.ctx.model = { ...h.ctx.model, provider: "anthropic", api: "anthropic-messages" };
   assert.equal(h.warm(), undefined);
   assert.equal(await h.request(h.payload()), undefined);
+});
+
+test("now is queued without inference, and status does not consume it", async () => {
+  const h = fixture();
+  await h.toggle("now");
+  assert.equal(h.authCalls(), 0);
+  assert.match(h.notices.at(-1), /queued.*next eligible message request/);
+  await h.toggle("status");
+  assert.match(h.notices.at(-1), /one-shot pending/);
+  assert.deepEqual(h.entries.map(e => e.data), [{ pending: true }]);
+  await h.request(h.payload());
+  await h.toggle("status");
+  assert.doesNotMatch(h.notices.at(-1), /one-shot pending/);
+});
+
+for (const [flag, startupThreshold] of [[true, "25000"], [false, "25000"], [true, undefined]]) {
+  test(`now leaves startup settings unchanged (enabled=${flag}, threshold=${startupThreshold})`, async () => {
+    const h = fixture({}, flag, startupThreshold);
+    await h.toggle("now");
+    const original = h.payload();
+    const result = await h.request(original);
+    assert.deepEqual(result.context_management, [{ type: "compaction", compact_threshold: 1000 }]);
+    assert.equal(original.context_management, undefined, "do not mutate the incoming payload");
+    const normal = await h.request(h.payload());
+    assert.deepEqual(normal?.context_management, flag ? [{ type: "compaction", compact_threshold:
+      startupThreshold === undefined ? 55084 : Number(startupThreshold) }] : undefined);
+    assert.equal(h.entries.some(e => e.customType.endsWith(":config")), false);
+  });
+}
+
+test("now adapts inline tools even when automatic compaction is off", async () => {
+  const h = fixture({}, false);
+  await h.toggle("now");
+  await h.context(["base", "hidden"]);
+  const payload = { ...h.payload(), input: [{ type: "additional_tools", role: "developer", tools: [
+    { type: "function", name: "base", parameters: { type: "object", properties: {} } },
+  ] }] };
+  const result = await h.request(payload);
+  assert.equal(result.context_management[0].compact_threshold, 1000);
+  assert.deepEqual(result.tools[0].tools.map(t => t.name), ["base"]);
+  assert.equal(JSON.stringify(result).includes("hidden"), false);
+  assert.deepEqual(h.warm(), { action: "stop" });
+});
+
+test("now stays pending across missing credentials, warming and standard compaction", async () => {
+  const h = fixture({}, false);
+  await h.toggle("now");
+  const resolve = h.ctx.modelRegistry.getApiKeyAndHeaders;
+  h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: false });
+  assert.equal(await h.request(h.payload()), undefined);
+  assert.deepEqual(h.entries.at(-1).data, { pending: true });
+  h.ctx.modelRegistry.getApiKeyAndHeaders = resolve;
+  await h.dispatch("agent_end");
+  await h.request(h.payload()); // A cache-warming/nested call outside an ordinary turn.
+  assert.equal(h.warm(), undefined);
+  await h.dispatch("turn_start");
+  await h.dispatch("session_before_compact");
+  await h.request(h.payload());
+  assert.deepEqual(h.entries.at(-1).data, { pending: true });
+  await h.dispatch("session_compact");
+  const result = await h.request(h.payload());
+  assert.equal(result.context_management[0].compact_threshold, 1000);
+  assert.deepEqual(h.entries.at(-1).data, { pending: false });
+});
+
+for (const args of ["now 1000", "now extra more", "now -1"]) {
+  test(`invalid now arguments do not change configuration: ${args}`, async () => {
+    const h = fixture({}, false);
+    await h.toggle(args);
+    assert.match(h.notices.at(-1), /Use \/server-compaction/);
+    assert.equal(h.entries.length, 0);
+    assert.equal(await h.request(h.payload()), undefined);
+  });
+}
+
+test("now refuses unsupported routes without arming a request", async () => {
+  const h = fixture({ baseUrl: "https://example.com/v1" });
+  await h.toggle("now");
+  assert.match(h.notices.at(-1), /unavailable for the current provider\/model/);
+  assert.equal(h.entries.length, 0);
+  assert.equal(h.authCalls(), 0);
 });
 
 test("package exports no legacy transport or compat serializer helpers", async () => {

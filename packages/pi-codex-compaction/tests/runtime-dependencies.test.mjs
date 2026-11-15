@@ -115,7 +115,7 @@ function response(output, id) {
 }
 
 for (const mode of ["print", "json", "rpc"]) {
-  test(`packed extension adopts, continues tools and reloads in ${mode} mode with host-only peers`, async (t) => {
+  test(`packed one-shot restores settings, adopts, continues tools and reloads in ${mode} mode with host-only peers`, async (t) => {
     const requests = [];
     const outputs = [[checkpoint, call], [text("msg_tool_done")], [text("msg_reloaded")]];
     t.mock.method(globalThis, "fetch", async (url, init) => {
@@ -150,7 +150,9 @@ for (const mode of ["print", "json", "rpc"]) {
     const errors = [];
     try {
       await session.bindExtensions({ mode, onError: (error) => errors.push(error) });
-      await session.prompt("/server-compaction on 1000");
+      await session.prompt("/server-compaction on 20000");
+      await session.prompt("/server-compaction now");
+      assert.equal(requests.length, 0, "queuing must not send a request");
       await session.prompt("synthetic old context");
       assert.deepEqual(errors.map(error => ({ event: error.event, error: error.error })), []);
       assert.equal(requests.length, 2, "ordinary inference plus tool continuation only");
@@ -159,6 +161,8 @@ for (const mode of ["print", "json", "rpc"]) {
           type: i.type, role: i.role, tools: i.tools?.map(t => [t.type, t.name]),
         })), tools: requests[0].tools?.map(t => [t.type, t.name]) }));
       assert.equal(manager.getBranch().some((item) => item.type === "compaction" && item.details?.kind === kind), true);
+      assert.deepEqual(requests[1].context_management, [{ type: "compaction", compact_threshold: 20000 }],
+        "the packed extension restores the original threshold for tool continuation");
       assert.deepEqual(requests[1].input.find((item) => item.type === "compaction"), checkpoint);
       assert.deepEqual(requests[1].input.find((item) => item.type === "function_call"), call);
       assert.equal(requests[1].input.find((item) => item.type === "function_call_output").output, "tool result");

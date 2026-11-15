@@ -9,6 +9,8 @@ and continue inference without Pi stopping for a separate summary request.
   changing providers, models, credentials, or billing mode.
 - Preserves Pi's effective tools, streamed text, tool continuations, and Fast tier.
 - Saves checkpoints on the session branch for reload and continuation.
+- Queues one-shot server compaction with `/server-compaction now` without changing
+  your regular threshold or automatic mode.
 - Keeps `/server-compaction off`, manual `/compact`, and Pi's standard compactor
   as recovery options.
 
@@ -94,12 +96,13 @@ a later extension from adding incompatible fields.
 
 ```text
 /server-compaction status
+/server-compaction now
 /server-compaction off
 /server-compaction on
 /server-compaction on 100000
 ```
 
-Commands persist the mode and optional token threshold on the current session
+`on` and `off` persist the mode and optional token threshold on the current session
 branch, not in global or project settings. `on` without a number uses the startup
 threshold, or the default when none was supplied.
 
@@ -114,8 +117,36 @@ thresholds must be integers of at least 1,000 and below Pi's local trigger.
 Invalid or too-late thresholds leave ordinary inference unchanged.
 
 Very small thresholds can compact repeatedly within one response and increase
-latency and token use. Do not use the 1,000-token protocol-test threshold for
-ordinary long sessions.
+latency and token use. Do not leave a 1,000-token threshold configured for
+ordinary long sessions; use the one-shot command below instead.
+
+### One-shot compaction on the next message
+
+Run `/server-compaction now`, then send your next message normally. The command
+only queues the operation: it does not send a request, inject a message, call
+Pi's `/compact`, or invoke the standalone `/responses/compact` endpoint.
+
+The next eligible ordinary model request uses a temporary **1,000-token**
+compaction threshold. The regular threshold and on/off configuration are never
+changed, so subsequent requests—including tool continuations within the same
+message—automatically use your original settings. This also works as a one-shot
+when automatic compaction is off; it remains off afterward.
+
+- Pending/consumed state is saved on the current session branch and survives
+  reload. `/server-compaction status` shows whether a one-shot is pending.
+- Repeating `now` does not stack operations. An explicit `on` or `off` cancels a
+  pending one-shot.
+- Unsupported or incompatible requests, missing credentials, cache warming,
+  and Pi's standard summarization do not consume it. Unsupported models/routes
+  are rejected when the command is entered.
+- The one-shot is consumed when an eligible request is prepared, even if it later
+  fails, is cancelled, or returns no checkpoint. It does not add retries. Existing
+  failure-pause and recovery behavior still applies; `on`, `now`, or reload can
+  resume server compaction.
+- This requests compaction, not a guarantee of a checkpoint: the server decides
+  whether to compact, and context below 1,000 tokens may not reach the threshold.
+  A very low threshold can compact more than once within that one response and
+  can increase latency and token use. It is never left enabled for later requests.
 
 ## How continuation works
 
@@ -204,8 +235,9 @@ for the separate reasoning-update limitation.
   including custom instructions, uses Pi's standard summarizer.
 - Failed, cancelled, malformed, oversized, or unsupported output does not
   replace history. An unsuccessful automatic attempt pauses new automatic
-  requests until `/server-compaction on` or session reload. The extension does
-  not issue an extra paid retry or switch credentials; Pi owns its own retries.
+  requests until `/server-compaction on`, `/server-compaction now`, or session
+  reload. The extension does not issue an extra paid retry or switch credentials;
+  Pi owns its own retries.
 - Adoption supports reasoning, single-text assistant messages, function/custom
   calls, and compaction items. Other output shapes leave history intact.
 - Replay requires the same model, endpoint, auth mode, credential and relevant

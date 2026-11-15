@@ -11,6 +11,8 @@ import { hybridTools } from "./inline-tools.js";
 
 const KIND = "pi-codex-compaction:automatic:v1";
 const CONFIG = `${KIND}:config`;
+const ONE_SHOT = `${KIND}:now`;
+const MIN_THRESHOLD = 1000;
 const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_ITEMS = 1024;
 const ENDPOINT = "https://api.openai.com/v1";
@@ -277,6 +279,7 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
   pi.registerFlag("server-compaction-threshold", { type: "string",
     description: "Server compaction threshold in tokens (>=1000; default: 60% of Pi's trigger)" });
   let override: { enabled: boolean; threshold?: number } | undefined;
+  let pendingNow = false;
   let inTurn = false;
   let compacting = false;
   let attempt: Attempt | undefined;
@@ -288,6 +291,7 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
   const modelKey = (model: Model<any>) => JSON.stringify([model.provider, model.api, model.id, model.baseUrl]);
 
   const enabled = () => override?.enabled ?? pi.getFlag("server-compaction") === true;
+  const requested = () => enabled() || pendingNow;
   const reset = (_event: unknown, ctx: ExtensionContext) => {
     inTurn = false;
     compacting = false;
@@ -298,12 +302,16 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
     retryEntry = undefined;
     retryNotified = false;
     override = undefined;
+    pendingNow = false;
     for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom" && entry.customType === CONFIG && record(entry.data) &&
-          typeof entry.data.enabled === "boolean") {
+      if (entry.type !== "custom" || !record(entry.data)) continue;
+      if (entry.customType === CONFIG && typeof entry.data.enabled === "boolean") {
         override = { enabled: entry.data.enabled,
-          ...(Number.isSafeInteger(entry.data.threshold) && Number(entry.data.threshold) >= 1000
+          ...(Number.isSafeInteger(entry.data.threshold) && Number(entry.data.threshold) >= MIN_THRESHOLD
             ? { threshold: Number(entry.data.threshold) } : {}) };
+        pendingNow = false; // Explicit on/off commands cancel an earlier one-shot.
+      } else if (entry.customType === ONE_SHOT && typeof entry.data.pending === "boolean") {
+        pendingNow = entry.data.pending;
       }
     }
   };
@@ -316,7 +324,7 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
   pi.on("session_compact_failed", () => { compacting = false; });
   pi.on("agent_end", () => { inTurn = false; attempt = undefined; });
   pi.on("context_with_system", (event, ctx) => {
-    if (!inTurn || compacting || !enabled() || !supports(ctx.model)) return;
+    if (!inTurn || compacting || !requested() || !supports(ctx.model)) return;
     // Observation only. The serialized payload later filters hidden declarations.
     currentToolNames = getCurrentSystemMessage(event.messages)?.toolsAdded?.map(tool => tool.name);
   });
@@ -327,23 +335,36 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
     ctx.model && warmingModel === modelKey(ctx.model) ? { action: "stop" } : undefined);
 
   pi.registerCommand("server-compaction", {
-    description: "Automatic compaction: on [token threshold], off, or status (default: on)",
+    description: "Server compaction: now (next request), on [token threshold], off, or status (default: on)",
     handler: async (args, ctx) => {
       const [action = "status", raw, ...extra] = args.trim() ? args.trim().split(/\s+/) : [];
-      if (!["on", "off", "status"].includes(action) || extra.length > 0 ||
+      if (!["on", "off", "status", "now"].includes(action) || extra.length > 0 ||
           (raw !== undefined && (action !== "on" || !/^\d+$/.test(raw) ||
-            !Number.isSafeInteger(Number(raw)) || Number(raw) < 1000))) {
-        if (ctx.hasUI) ctx.ui.notify("Use /server-compaction on [tokens >=1000], off, or status", "warning");
+            !Number.isSafeInteger(Number(raw)) || Number(raw) < MIN_THRESHOLD))) {
+        if (ctx.hasUI) ctx.ui.notify("Use /server-compaction now, on [tokens >=1000], off, or status", "warning");
         return;
       }
       if (action !== "status") {
         await ctx.waitForIdle();
+        if (action === "now") {
+          if (!supports(ctx.model)) {
+            if (ctx.hasUI) ctx.ui.notify("Server compaction is unavailable for the current provider/model.", "warning");
+            return;
+          }
+          pi.appendEntry(ONE_SHOT, { pending: true });
+          pendingNow = true;
+          blocked = false;
+          if (ctx.hasUI) ctx.ui.notify("Server compaction queued for your next eligible message request (1000-token threshold). No request sent yet; regular settings will be restored automatically.", "info");
+          return;
+        }
         override = { enabled: action === "on", ...(raw ? { threshold: Number(raw) } : {}) };
         pi.appendEntry(CONFIG, override);
+        pendingNow = false;
         blocked = false;
       }
-      const note = !supports(ctx.model) ? " (unavailable for the current provider/model)"
-        : blocked ? " (paused after an unsuccessful request)" : "";
+      const note = (!supports(ctx.model) ? " (unavailable for the current provider/model)"
+        : blocked ? " (paused after an unsuccessful request)" : "") +
+        (pendingNow ? " (one-shot pending for the next eligible request)" : "");
       if (ctx.hasUI) ctx.ui.notify(`Server compaction: ${enabled() ? "on" : "off"}${note}. Public OpenAI Responses only; Pi compaction remains the safety net.`, "info");
     },
   });
@@ -359,13 +380,13 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
     const reserve = perModel?.reserveTokens ?? settings?.reserveTokens ?? 16_384;
     const trigger = ctx.model.contextWindow - reserve;
     const raw = override?.threshold ?? pi.getFlag("server-compaction-threshold");
-    const threshold = raw === undefined ? Math.floor(trigger * 0.6) : Number(raw);
-    const validThreshold = Number.isSafeInteger(threshold) && threshold >= 1000 && threshold < trigger;
-    const snapshot = enabled() && !blocked && inTurn && !compacting && validThreshold && !incompatible(payload, true)
+    const threshold = pendingNow ? MIN_THRESHOLD : raw === undefined ? Math.floor(trigger * 0.6) : Number(raw);
+    const validThreshold = Number.isSafeInteger(threshold) && threshold >= MIN_THRESHOLD && threshold < trigger;
+    const snapshot = requested() && !blocked && inTurn && !compacting && validThreshold && !incompatible(payload, true)
       ? hybridTools(payload, currentToolNames)
       : undefined;
     // Disabled mode with no saved checkpoint must not cause extra auth resolution.
-    if (!checkpoint && (!enabled() || blocked || !inTurn || compacting || incompatible(payload, !!snapshot))) return;
+    if (!checkpoint && (!requested() || blocked || !inTurn || compacting || incompatible(payload, !!snapshot))) return;
     const credential = await identity(ctx);
     if (!credential) return;
     if (snapshot) payload = snapshot;
@@ -373,10 +394,17 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
       payload = replay(payload, checkpoint, ctx, !!snapshot) ?? payload;
     }
     // Do not configure standalone summarization, cache warming, or foreign nested calls.
-    if (!enabled() || blocked || !inTurn || compacting || incompatible(payload, !!snapshot) || !validThreshold) return payload;
+    if (!requested() || blocked || !inTurn || compacting || incompatible(payload, !!snapshot) || !validThreshold) return payload;
     const hoisted = hoistEffort(payload);
     if (!hoisted) return payload;
     payload = hoisted;
+    // Consume only after eligibility, tool adaptation and auth checks pass. Never
+    // overwrite the regular configuration; even tool continuations and reloads
+    // must stop using this low threshold after this single request attempt.
+    if (pendingNow) {
+      pi.appendEntry(ONE_SHOT, { pending: false });
+      pendingNow = false;
+    }
     attempt = { sessionId: ctx.sessionManager.getSessionId(), model: ctx.model.id, identity: credential,
       leafId: ctx.sessionManager.getLeafId(), invalid: false, completed: false,
       items: new Map(), itemBytes: 0, started: performance.now() };

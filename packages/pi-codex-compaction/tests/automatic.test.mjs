@@ -141,6 +141,165 @@ test("real Pi enables public server compaction by default without a command or s
   } finally { await h.close(); }
 });
 
+for (const configuration of ["default", "custom", "off"]) {
+  test(`one-shot now restores ${configuration} settings before tool continuation and after reload`, async t => {
+    const call = { type: "function_call", id: "fc_now", call_id: "call_now", name: "now_fixture",
+      arguments: "{}", status: "completed" };
+    const requests = mockResponses(t, [[checkpoint(), call], [text("msg_now", "done")], [text("msg_later", "later")]]);
+    let localCompactions = 0;
+    const h = await harness({ enabled: configuration === "off" ? false : null, factories: [pi => {
+      pi.on("session_before_compact", () => { localCompactions++; });
+      pi.registerTool({ name: "now_fixture", label: "Now fixture", description: "One-shot continuation fixture",
+        parameters: { type: "object", properties: {} },
+        async execute() { return { content: [{ type: "text", text: "ok" }], details: undefined }; },
+      });
+    }] });
+    t.after(() => h.close());
+    if (configuration === "custom") await h.session.prompt("/server-compaction on 20000");
+    const configs = () => h.manager.getBranch().filter(e => e.customType === `${kind}:config`).map(e => e.data);
+    const original = structuredClone(configs());
+    const expected = configuration === "off" ? undefined : [{ type: "compaction", compact_threshold:
+      configuration === "custom" ? 20000 : Math.floor((h.model.contextWindow - 8192) * 0.6) }];
+
+    await h.session.prompt("/server-compaction now");
+    await h.session.prompt("/server-compaction status");
+    assert.equal(requests.length, 0, "arming/status must not issue inference or inject a user message");
+    assert.deepEqual(configs(), original, "the original config is never replaced by a low threshold");
+    assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, true);
+
+    await h.session.prompt("use now_fixture");
+    assert.equal(requests.length, 2, "only the ordinary request and natural tool continuation run");
+    assert.deepEqual(requests[0].context_management, [{ type: "compaction", compact_threshold: 1000 }]);
+    assert.deepEqual(requests[1].context_management, expected, "restore before the next tool continuation");
+    assert.deepEqual(requests[1].input.find(i => i.type === "compaction"), checkpoint());
+    assert.equal(requests[1].input.find(i => i.type === "function_call_output").output, "ok");
+    assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, false);
+    assert.equal(localCompactions, 0, "never invoke Pi's standard summarizer for now");
+    assert.deepEqual(configs(), original);
+
+    await h.session.reload();
+    await h.session.prompt("continue normally");
+    assert.deepEqual(requests[2].context_management, expected, "consumption survives reload");
+    assert.deepEqual(configs(), original);
+    assert.deepEqual(h.errors, []);
+  });
+}
+
+test("pending now survives reload and repeated commands do not stack requests", async t => {
+  const requests = mockResponses(t, [[checkpoint(), text("msg_now", "done")], [text("msg_next", "next")]]);
+  const h = await harness({ enabled: null });
+  t.after(() => h.close());
+  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("/server-compaction now");
+  await h.session.reload();
+  assert.equal(requests.length, 0);
+  await h.session.prompt("ordinary message");
+  await h.session.prompt("another message");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].context_management[0].compact_threshold, 1000);
+  assert.equal(requests[1].context_management[0].compact_threshold, Math.floor((h.model.contextWindow - 8192) * 0.6));
+  assert.deepEqual(h.errors, []);
+});
+
+test("an incompatible request leaves now pending until an eligible request", async t => {
+  let skip = true;
+  const requests = mockResponses(t, [[text("msg_skip", "skipped")], [checkpoint(), text("msg_now", "compacted")],
+    [text("msg_after", "normal")]]);
+  const h = await harness({ enabled: null, extensionLast: true, factories: [pi => {
+    pi.on("before_provider_request", event => { if (skip) event.payload.background = true; });
+  }] });
+  t.after(() => h.close());
+  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("incompatible request");
+  assert.equal(requests[0].context_management, undefined);
+  assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, true);
+  skip = false;
+  await h.session.prompt("eligible request");
+  assert.equal(requests[1].context_management[0].compact_threshold, 1000);
+  await h.session.prompt("back to normal");
+  assert.equal(requests[2].context_management[0].compact_threshold, Math.floor((h.model.contextWindow - 8192) * 0.6));
+  assert.deepEqual(h.errors, []);
+});
+
+for (const action of ["on 20000", "off"]) {
+  test(`explicit ${action} cancels a pending now, including across reload`, async t => {
+    const requests = mockResponses(t, [[text("msg_normal", "normal")]]);
+    const h = await harness({ enabled: null });
+    t.after(() => h.close());
+    await h.session.prompt("/server-compaction now");
+    await h.session.prompt(`/server-compaction ${action}`);
+    await h.session.reload();
+    await h.session.prompt("ordinary message");
+    assert.deepEqual(requests[0].context_management, action === "off" ? undefined : [
+      { type: "compaction", compact_threshold: 20000 },
+    ]);
+    assert.deepEqual(h.errors, []);
+  });
+}
+
+test("a failed one-shot is consumed without paid retries and does not change the regular threshold", async t => {
+  const requests = mockResponses(t, [
+    new Response(JSON.stringify({ error: { message: "fixture rejection", type: "invalid_request_error" } }), { status: 400 }),
+    [text("msg_normal", "normal")],
+  ]);
+  const h = await harness({ enabled: null });
+  t.after(() => h.close());
+  await h.session.prompt("/server-compaction on 20000");
+  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("try compaction");
+  assert.equal(requests.length, 1, "no separate request or paid retry");
+  assert.equal(requests[0].context_management[0].compact_threshold, 1000);
+  assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, false);
+  await h.session.reload(); // Existing failure-pause semantics are unchanged until reload/on/now.
+  await h.session.prompt("continue normally");
+  assert.equal(requests[1].context_management[0].compact_threshold, 20000);
+  assert.equal(h.manager.getBranch().some(e => e.type === "compaction"), false);
+  assert.deepEqual(h.errors, []);
+});
+
+for (const outcome of ["no-checkpoint", "cancelled"]) {
+  test(`one-shot ${outcome} does not leave a low threshold after reload`, async t => {
+    const requests = mockResponses(t, [
+      outcome === "cancelled" ? [checkpoint(), text("msg_cancelled", "cancelled")] : [text("msg_plain", "plain answer")],
+      [text("msg_later", "normal answer")],
+    ]);
+    const h = await harness({ enabled: null, factories: [pi => pi.on("provider_stream_event", (event, ctx) => {
+      if (outcome === "cancelled" && event.data?.type === "response.output_item.done" &&
+          event.data.item?.type === "compaction") ctx.abort();
+    })] });
+    t.after(() => h.close());
+    await h.session.prompt("/server-compaction on 20000");
+    await h.session.prompt("/server-compaction now");
+    await h.session.prompt("try compaction");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].context_management[0].compact_threshold, 1000);
+    assert.equal(h.manager.getBranch().some(e => e.type === "compaction"), false);
+    assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, false);
+    await h.session.reload();
+    await h.session.prompt("continue normally");
+    assert.equal(requests[1].context_management[0].compact_threshold, 20000);
+    assert.deepEqual(h.errors, []);
+  });
+}
+
+test("branch navigation restores pending now only on the selected branch", async t => {
+  const requests = mockResponses(t, [[text("msg_first", "first")], [text("msg_other", "other branch")],
+    [checkpoint(), text("msg_now", "compacted")]]);
+  const h = await harness({ enabled: null });
+  t.after(() => h.close());
+  await h.session.prompt("first message");
+  const before = h.manager.getLeafId();
+  await h.session.prompt("/server-compaction now");
+  const armed = h.manager.getLeafId();
+  await h.session.navigateTree(before, { summarize: false });
+  await h.session.prompt("abandon pending request");
+  assert.equal(requests[1].context_management[0].compact_threshold, Math.floor((h.model.contextWindow - 8192) * 0.6));
+  await h.session.navigateTree(armed, { summarize: false });
+  await h.session.prompt("return to armed branch");
+  assert.equal(requests[2].context_management[0].compact_threshold, 1000);
+  assert.deepEqual(h.errors, []);
+});
+
 test("real Pi adopts a mid-response checkpoint and replays its exact suffix without another request", async (t) => {
   const suffix = text("msg_after", "retained answer");
   const requests = mockResponses(t, [
