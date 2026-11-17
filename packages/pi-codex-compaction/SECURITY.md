@@ -28,11 +28,33 @@ trusted packages. This extension enables automatic compaction by default only
 for eligible `openai` GPT-5/GPT-6 models on `openai-responses` at the exact
 official endpoint `https://api.openai.com/v1`.
 
-It transforms ordinary Pi requests; it does not make direct HTTP inference
-requests, register a provider, or use ChatGPT's legacy backend endpoints.
-Pi owns TLS, transport limits, cancellation, provider retries, authentication,
-and credential refresh. The extension does not copy credentials between
-providers or fall back from subscription authentication to API-key billing.
+Automatic mode and `/server-compaction next` transform ordinary Pi requests;
+Pi owns their TLS, transport limits, cancellation, retries, authentication and
+credential refresh. Explicit `/server-compaction now` makes one standalone HTTP
+request to the exact official `https://api.openai.com/v1/responses/compact` URL.
+It uses the current Pi-resolved credential and headers in either auth mode,
+rejects base-URL overrides, follows no redirects, and never falls back between
+OAuth and API-key billing, providers, or endpoints. Standalone endpoint access
+is account-dependent and is not implied by ordinary inference access; neither
+auth path has been live-verified for this endpoint. No provider is registered
+and no legacy ChatGPT backend endpoint is used.
+
+The standalone operation serializes the stored, context-edited session projection
+through the configured provider's public payload boundary with transport blocked.
+It does not invoke ordinary request-only extension hooks: request-only redactions
+or service-tier transformations are not applied. Treat `now` as an explicit send
+of that projected session to OpenAI, not as a replay of another extension's last
+transformed HTTP payload. It injects no conversation turn. It uses Pi's public
+compaction lifecycle, preserving ordinary `/compact` behavior.
+
+Standalone transport has a 120-second deadline, 4 MiB request/response limits,
+1,024-item limits, and no automatic retry. Its response is read incrementally
+with an enforced byte bound. Response bodies and arbitrary transport/auth errors
+are never displayed or logged; only locally authored safe errors, including HTTP
+status numbers, may be shown. Failure/cancellation explicitly cancels Pi's
+compaction hook, rather than throwing and silently running its standard summarizer.
+Context, branch, model and credential identity are rechecked before adoption.
+Standalone usage is attached once to the compaction entry, not a synthetic reply.
 
 ## Checkpoints and local data
 
@@ -42,6 +64,14 @@ Added/partial items are never treated as checkpoints. Unknown output forms,
 missing indices, failed streams, and cancellation leave history intact.
 Encrypted checkpoint strings are additionally limited to 2 million characters.
 The complete persisted details are bounded to 4 MiB.
+
+Standalone output is the complete canonical next context window, not a streamed
+checkpoint suffix. It is saved/replayed in order without pruning retained items.
+It must contain a valid encrypted compaction item and only supported conversation
+items. Retained tool/configuration declarations are rejected: replaying stale
+declarations could undo a later tool removal or visibility restriction. Replay
+still verifies the retained assistant hash and provider serialization before
+substituting the window; current tool declarations are restored afterward.
 
 The checkpoint and its exact post-checkpoint output suffix are sensitive session
 data. Provider encryption does not make the surrounding transcript or suffix

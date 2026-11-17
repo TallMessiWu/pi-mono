@@ -9,8 +9,8 @@ and continue inference without Pi stopping for a separate summary request.
   changing providers, models, credentials, or billing mode.
 - Preserves Pi's effective tools, streamed text, tool continuations, and Fast tier.
 - Saves checkpoints on the session branch for reload and continuation.
-- Queues one-shot server compaction with `/server-compaction now` without changing
-  your regular threshold or automatic mode.
+- Compacts immediately with `/server-compaction now`, or queues the next message
+  with `/server-compaction next`, without changing your regular automatic settings.
 - Keeps `/server-compaction off`, manual `/compact`, and Pi's standard compactor
   as recovery options.
 
@@ -109,6 +109,7 @@ a later extension from adding incompatible fields.
 ```text
 /server-compaction status
 /server-compaction now
+/server-compaction next
 /server-compaction off
 /server-compaction on
 /server-compaction on 100000
@@ -132,9 +133,44 @@ Very small thresholds can compact repeatedly within one response and increase
 latency and token use. Do not leave a 1,000-token threshold configured for
 ordinary long sessions; use the one-shot command below instead.
 
+### Immediate server compaction
+
+Run `/server-compaction now` to send one explicit request to the official
+`https://api.openai.com/v1/responses/compact` endpoint and save the result before
+returning. There is no need to send another message. It does not inject a user
+message or generate an ordinary assistant reply. Your automatic on/off mode and
+threshold stay unchanged; an already-pending `next` operation is cancelled.
+
+This uses Pi's public compaction lifecycle for cancellation, persistence and UI
+refresh, but replaces its summary generation with server compaction. Ordinary
+`/compact`, including custom instructions, still uses Pi's standard summarizer.
+Pi may refuse sessions that are too small or already compacted; finish an ordinary
+assistant response first. The whole returned context window is retained verbatim,
+including items before or after the encrypted checkpoint. Standalone usage is
+stored on the compaction entry once, separately from ordinary response usage.
+
+Both authentication modes resolve the **current** credential through Pi:
+ChatGPT OAuth is sent as OAuth, and an API key is sent as that API key. There is
+no fallback between them, to another provider, or to legacy backend endpoints.
+The account/model must permit the standalone endpoint: ordinary `/responses`
+access alone is not proof of that permission. Both auth paths have mocked
+contract coverage; standalone endpoint acceptance has **not** been live-verified
+with either authentication mode. A rejected endpoint leaves context unchanged;
+use `next` for the existing in-response route instead.
+
+An explicit standalone request can consume additional quota/API usage. It has a
+120-second deadline and 4 MiB request/response limits, follows no redirects, and
+makes no automatic retry. Cancellation, malformed/unsupported output, changed
+context or credentials, and failed replay leave history intact. Windows that
+retain tool/configuration declarations are rejected rather than restoring stale
+tools. Only finished ordinary assistant responses can be retained as the local
+replay anchor. This operation serializes Pi's stored, context-edited projection;
+ordinary request-only extension transformations (including Fast-tier settings or
+request-only redactions) are not run for the standalone endpoint.
+
 ### One-shot compaction on the next message
 
-Run `/server-compaction now`, then send your next message normally. The command
+Run `/server-compaction next`, then send your next message normally. The command
 only queues the operation: it does not send a request, inject a message, call
 Pi's `/compact`, or invoke the standalone `/responses/compact` endpoint.
 
@@ -146,15 +182,16 @@ when automatic compaction is off; it remains off afterward.
 
 - Pending/consumed state is saved on the current session branch and survives
   reload. `/server-compaction status` shows whether a one-shot is pending.
-- Repeating `now` does not stack operations. An explicit `on` or `off` cancels a
-  pending one-shot.
+- Repeating `next` does not stack operations. An explicit `on`, `off`, or immediate
+  `now` cancels a pending one-shot. Pending operations saved by older versions of
+  the `now` command remain compatible after reload.
 - Unsupported or incompatible requests, missing credentials, cache warming,
   and Pi's standard summarization do not consume it. Unsupported models/routes
   are rejected when the command is entered.
 - The one-shot is consumed when an eligible request is prepared, even if it later
   fails, is cancelled, or returns no checkpoint. It does not add retries. Existing
   failure-pause and recovery behavior still applies; `on`, `now`, or reload can
-  resume server compaction.
+  resume server compaction (`next` also clears a failure pause).
 - This requests compaction, not a guarantee of a checkpoint: the server decides
   whether to compact, and context below 1,000 tokens may not reach the threshold.
   A very low threshold can compact more than once within that one response and
@@ -164,8 +201,8 @@ when automatic compaction is off; it remains off afterward.
 
 The extension adds
 `context_management: [{ type: "compaction", compact_threshold: ... }]`,
-`store: false`, and `stream: true` to eligible ordinary requests. It does not
-construct a separate compaction request. Compatible requests retain Pi's grammar
+`store: false`, and `stream: true` to eligible ordinary requests. Automatic mode
+and `next` do not construct a separate compaction request; only explicit `now` does. Compatible requests retain Pi's grammar
 tools, hidden loadouts, reasoning options, and Fast settings.
 
 For Pi 1.4's inline tool declarations, the extension derives the initial visible
@@ -211,9 +248,10 @@ inference during the server's compaction pass. It does not set `background: true
 
 Authentication stays with Pi: `/login openai` with **Sign in with ChatGPT**
 uses plan quota; an OpenAI API key uses separate API billing. Neither path
-falls back to the other. This is automatic `context_management` in ordinary
-`/responses`, not the standalone `/responses/compact` API or the removed private
-RemoteCompactionV2 protocol.
+falls back to the other. Automatic mode and `next` use `context_management` in
+ordinary `/responses`; explicit `now` uses standalone `/responses/compact` with
+the same current credential, subject to account endpoint permissions. Neither
+path uses the removed private RemoteCompactionV2 protocol.
 
 | Route | Behavior |
 | --- | --- |
@@ -247,8 +285,8 @@ for the separate reasoning-update limitation.
   including custom instructions, uses Pi's standard summarizer.
 - Failed, cancelled, malformed, oversized, or unsupported output does not
   replace history. An unsuccessful automatic attempt pauses new automatic
-  requests until `/server-compaction on`, `/server-compaction now`, or session
-  reload. The extension does not issue an extra paid retry or switch credentials;
+  requests until `/server-compaction on`, `/server-compaction next`, successful
+  `/server-compaction now`, or session reload. The extension does not issue an extra paid retry or switch credentials;
   Pi owns its own retries.
 - Adoption supports reasoning, single-text assistant messages, function/custom
   calls, and compaction items. Other output shapes leave history intact.
@@ -269,7 +307,8 @@ for the separate reasoning-update limitation.
   invalidate cached prefixes. Stable subsequent requests can reuse cache again.
   The extension preserves Pi's existing affinity/cache fields and does not
   enable explicit-cache options rejected by the tested ChatGPT sign-in route.
-- Usage stays on the ordinary assistant response and is counted once. Bounded
+- Automatic-compaction usage stays on the ordinary assistant response and is
+  counted once. Explicit standalone usage is counted once on its compaction entry. Bounded
   success diagnostics stay local; they contain timing and size counters, not
   conversation content.
 
@@ -366,7 +405,19 @@ host-peer installation suppressed, then load it through the installed Pi CLI.
 `--server-compaction` flags without loading errors or host-dependency warnings.
 Never add Pi peers to the candidate directory to make this smoke test pass.
 
-For an approved TUI smoke test, cross the configured threshold in a synthetic
+For an approved **immediate-compaction** smoke test, separately test an OpenAI
+API key and ChatGPT OAuth on the public `openai` route with synthetic context.
+Obtain approval before consuming quota/billing. Run `/server-compaction now`
+without a follow-up message: check that Pi shows compaction start/completion,
+no extra user/assistant turn appears, and a checkpoint is already saved. Verify
+fact recall and a harmless tool call after `/reload`, with automatic mode off,
+and after branch navigation. Cancel an in-progress operation and confirm history
+is unchanged. If the endpoint rejects the current account, verify the explicit
+failure without retries, credential changes or standard summary generation; use
+`next` to check the existing automatic route. Do not treat mocked OAuth coverage
+as confirmation that an account is allowed to use the standalone endpoint.
+
+For an approved automatic-compaction TUI smoke test, cross the configured threshold in a synthetic
 session, then check facts from earlier turns and a tool continuation. Check replay
 after `/reload`, mode-off, and branch navigation. Successful adoption should
 not start Pi's separate compaction lifecycle.

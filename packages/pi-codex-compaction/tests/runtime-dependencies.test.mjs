@@ -115,12 +115,18 @@ function response(output, id) {
 }
 
 for (const mode of ["print", "json", "rpc"]) {
-  test(`packed one-shot restores settings, adopts, continues tools and reloads in ${mode} mode with host-only peers`, async (t) => {
+  test(`packed next and immediate now adopt, continue tools and reload in ${mode} mode with host-only peers`, async (t) => {
     const requests = [];
     const outputs = [[checkpoint, call], [text("msg_tool_done")], [text("msg_reloaded")]];
+    const immediateCheckpoint = { ...checkpoint, id: "cmp_packed_now", encrypted_content: "synthetic-immediate-checkpoint" };
+    const window = [{ type: "message", role: "user", content: [{ type: "input_text", text: "retained standalone user" }] }, immediateCheckpoint];
     t.mock.method(globalThis, "fetch", async (url, init) => {
-      assert.equal(String(url), "https://api.openai.com/v1/responses");
       requests.push(JSON.parse(init.body));
+      if (String(url) === "https://api.openai.com/v1/responses/compact") {
+        return Response.json({ object: "response.compaction", id: "resp_packed_now", output: window,
+          usage: { input_tokens: 20, output_tokens: 5, total_tokens: 25 } });
+      }
+      assert.equal(String(url), "https://api.openai.com/v1/responses");
       assert.ok(outputs.length, "No extra inference or serialization request is allowed");
       return response(outputs.shift(), `resp_${requests.length}`);
     });
@@ -134,7 +140,7 @@ for (const mode of ["print", "json", "rpc"]) {
     // requests, which the public API requires.
     const model = { ...catalogModel, compat: { ...catalogModel.compat, supportsMidConvoEffort: false } };
     const settingsManager = SettingsManager.inMemory({
-      compaction: { enabled: false }, retry: { enabled: false },
+      compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false },
       defaultTools: ["packed_fixture"],
     });
     const manager = SessionManager.inMemory(temp);
@@ -151,7 +157,7 @@ for (const mode of ["print", "json", "rpc"]) {
     try {
       await session.bindExtensions({ mode, onError: (error) => errors.push(error) });
       await session.prompt("/server-compaction on 20000");
-      await session.prompt("/server-compaction now");
+      await session.prompt("/server-compaction next");
       assert.equal(requests.length, 0, "queuing must not send a request");
       await session.prompt("synthetic old context");
       assert.deepEqual(errors.map(error => ({ event: error.event, error: error.error })), []);
@@ -166,15 +172,19 @@ for (const mode of ["print", "json", "rpc"]) {
       assert.deepEqual(requests[1].input.find((item) => item.type === "compaction"), checkpoint);
       assert.deepEqual(requests[1].input.find((item) => item.type === "function_call"), call);
       assert.equal(requests[1].input.find((item) => item.type === "function_call_output").output, "tool result");
+      await session.prompt("/server-compaction now");
+      assert.equal(requests.length, 3, "now issues exactly one standalone request before the next message");
+      assert.deepEqual(manager.getBranch().filter(e => e.type === "compaction").at(-1).details.replay, window);
       await session.prompt("/server-compaction off");
       await session.reload();
       assert.deepEqual(loader.getExtensions().errors, []);
       await session.prompt("synthetic next context");
-      assert.equal(requests.length, 3);
-      assert.equal(requests[2].context_management, undefined);
-      assert.deepEqual(requests[2].input.find((item) => item.type === "compaction"), checkpoint);
-      assert.doesNotMatch(JSON.stringify(requests[2].input), /synthetic old context/);
-      assert.equal(session.getSessionStats().tokens.total, 75, "serialization must not add usage");
+      assert.equal(requests.length, 4);
+      assert.equal(requests[3].context_management, undefined);
+      assert.deepEqual(requests[3].input.find((item) => item.type === "compaction"), immediateCheckpoint);
+      assert.ok(requests[3].input.some(item => Array.isArray(item.content) && item.content.some(part => part.text === "retained standalone user")));
+      assert.doesNotMatch(JSON.stringify(requests[3].input), /synthetic old context/);
+      assert.equal(session.getSessionStats().tokens.total, 100, "standalone compaction adds usage once; serialization adds none");
       assert.deepEqual(errors, []);
     } finally { session.dispose(); }
   });

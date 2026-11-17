@@ -193,9 +193,9 @@ test("model switches do not carry an automatic warming veto to another provider"
   assert.equal(await h.request(h.payload()), undefined);
 });
 
-test("now is queued without inference, and status does not consume it", async () => {
+test("next is queued without inference, and status does not consume it", async () => {
   const h = fixture();
-  await h.toggle("now");
+  await h.toggle("next");
   assert.equal(h.authCalls(), 0);
   assert.match(h.notices.at(-1), /queued.*next eligible message request/);
   await h.toggle("status");
@@ -207,9 +207,9 @@ test("now is queued without inference, and status does not consume it", async ()
 });
 
 for (const [flag, startupThreshold] of [[true, "25000"], [false, "25000"], [true, undefined]]) {
-  test(`now leaves startup settings unchanged (enabled=${flag}, threshold=${startupThreshold})`, async () => {
+  test(`next leaves startup settings unchanged (enabled=${flag}, threshold=${startupThreshold})`, async () => {
     const h = fixture({}, flag, startupThreshold);
-    await h.toggle("now");
+    await h.toggle("next");
     const original = h.payload();
     const result = await h.request(original);
     assert.deepEqual(result.context_management, [{ type: "compaction", compact_threshold: 1000 }]);
@@ -221,9 +221,9 @@ for (const [flag, startupThreshold] of [[true, "25000"], [false, "25000"], [true
   });
 }
 
-test("now adapts inline tools even when automatic compaction is off", async () => {
+test("next adapts inline tools even when automatic compaction is off", async () => {
   const h = fixture({}, false);
-  await h.toggle("now");
+  await h.toggle("next");
   await h.context(["base", "hidden"]);
   const payload = { ...h.payload(), input: [{ type: "additional_tools", role: "developer", tools: [
     { type: "function", name: "base", parameters: { type: "object", properties: {} } },
@@ -235,9 +235,9 @@ test("now adapts inline tools even when automatic compaction is off", async () =
   assert.deepEqual(h.warm(), { action: "stop" });
 });
 
-test("now stays pending across missing credentials, warming and standard compaction", async () => {
+test("next stays pending across missing credentials, warming and standard compaction", async () => {
   const h = fixture({}, false);
-  await h.toggle("now");
+  await h.toggle("next");
   const resolve = h.ctx.modelRegistry.getApiKeyAndHeaders;
   h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: false });
   assert.equal(await h.request(h.payload()), undefined);
@@ -266,9 +266,9 @@ for (const args of ["now 1000", "now extra more", "now -1"]) {
   });
 }
 
-test("now refuses unsupported routes without arming a request", async () => {
+test("next refuses unsupported routes without arming a request", async () => {
   const h = fixture({ baseUrl: "https://example.com/v1" });
-  await h.toggle("now");
+  await h.toggle("next");
   assert.match(h.notices.at(-1), /unavailable for the current provider\/model/);
   assert.equal(h.entries.length, 0);
   assert.equal(h.authCalls(), 0);

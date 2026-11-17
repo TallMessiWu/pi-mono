@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { getCurrentSystemMessage, normalizeContext, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, normalizeContext, type AssistantMessage, type Message, type Model } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   serializeConversation,
@@ -8,6 +8,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { hybridTools } from "./inline-tools.js";
+import { CompactionError, requestStandaloneCompaction, validCompactedWindow } from "./standalone-compaction.js";
 
 const KIND = "pi-codex-compaction:automatic:v1";
 const CONFIG = `${KIND}:config`;
@@ -27,7 +28,9 @@ interface Checkpoint {
   assistantHash: string;
   /** Fingerprints of every normalized output item, including those before the checkpoint. */
   outputHashes: string[];
-  /** Exact provider checkpoint followed by the exact output suffix. */
+  /** Standalone compaction returns a complete canonical window, not a suffix. */
+  mode?: "standalone";
+  /** Exact provider checkpoint/suffix, or the entire standalone window. */
   replay: Item[];
 }
 
@@ -109,8 +112,9 @@ function activeCheckpoint(ctx: ExtensionContext): Checkpoint | undefined {
       typeof d.assistantEntryId !== "string" || entry.firstKeptEntryId !== d.assistantEntryId ||
       typeof d.assistantHash !== "string" || !Array.isArray(d.outputHashes) ||
       d.outputHashes.length > MAX_ITEMS || !d.outputHashes.every((v) => typeof v === "string") ||
-      !validOutput(d.replay) || d.replay[0]?.type !== "compaction" ||
-      d.replay.slice(1).some((item) => item.type === "compaction")) return undefined;
+      (d.mode === "standalone" ? !validCompactedWindow(d.replay) :
+        d.mode !== undefined || !validOutput(d.replay) || d.replay[0]?.type !== "compaction" ||
+        d.replay.slice(1).some((item) => item.type === "compaction"))) return undefined;
   return d as unknown as Checkpoint;
 }
 
@@ -162,6 +166,15 @@ function replay(payload: Item, checkpoint: Checkpoint, ctx: ExtensionContext, pr
   // Reintroduce those exact current declarations after the checkpoint and before
   // its output suffix. Preserve later tool changes/results and top-level tools.
   const prefix = payload.input.slice(0, index);
+  if (checkpoint.mode === "standalone") {
+    const inline = (item: unknown) => record(item) && item.type === "additional_tools";
+    return { ...payload, input: [
+      ...prefix.filter(item => !inline(item)),
+      ...structuredClone(checkpoint.replay), // Canonical window: never prune retained items.
+      ...prefix.filter(inline), ...effortUpdates,
+      ...payload.input.slice(start + serialized.length),
+    ] };
+  }
   const [saved, ...suffix] = structuredClone(checkpoint.replay);
   if (preserveInline) return { ...payload, input: [
     ...prefix, saved, ...effortUpdates, ...suffix, ...payload.input.slice(start + serialized.length),
@@ -243,18 +256,15 @@ function fallbackSummary(entries: SessionEntry[], ctx: ExtensionContext): string
  * The dummy credential, throwing fetch and zero retries prohibit inference,
  * even if a future host accidentally continues past the payload callback.
  */
-async function serializedAssistant(ctx: ExtensionContext, message: AssistantMessage): Promise<unknown[] | undefined> {
+async function serializedPayload(ctx: ExtensionContext, messages: Message[]): Promise<Item | undefined> {
   if (!supports(ctx.model) || ctx.signal?.aborted) return;
   const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
   if (!provider) return;
-  const system = getCurrentSystemMessage(ctx.sessionManager.buildSessionProjection().messages);
   const controller = new AbortController();
   const stop = new Error("Serialization only; no provider request allowed");
-  let input: unknown[] | undefined;
+  let captured: Item | undefined;
   let fetchAttempted = false;
-  const result = await provider.streamSimple(ctx.model, normalizeContext({
-    messages: [...(system ? [system] : []), message],
-  }), {
+  const result = await provider.streamSimple(ctx.model, normalizeContext({ messages }), {
     // Not an API key. No real credential is resolved or sent by this dry run.
     apiKey: "serialization-only",
     signal: controller.signal,
@@ -262,14 +272,19 @@ async function serializedAssistant(ctx: ExtensionContext, message: AssistantMess
     maxRetries: 0,
     fetch: async () => { fetchAttempted = true; throw stop; },
     onPayload: (payload) => {
-      if (record(payload) && Array.isArray(payload.input) && bytes(payload.input) <= MAX_BYTES) {
-        input = structuredClone(payload.input);
+      if (record(payload) && Array.isArray(payload.input) && bytes(payload) <= MAX_BYTES) {
+        captured = structuredClone(payload);
       }
       controller.abort();
       throw stop;
     },
   }).result();
-  return result.stopReason === "aborted" && !fetchAttempted && !ctx.signal?.aborted ? input : undefined;
+  return result.stopReason === "aborted" && !fetchAttempted && !ctx.signal?.aborted ? captured : undefined;
+}
+
+async function serializedAssistant(ctx: ExtensionContext, message: AssistantMessage): Promise<unknown[] | undefined> {
+  const system = getCurrentSystemMessage(ctx.sessionManager.buildSessionProjection().messages);
+  return (await serializedPayload(ctx, [...(system ? [system] : []), message]))?.input as unknown[] | undefined;
 }
 
 /** Public Pi hooks only. No provider replacement, synthetic model turn, or private registry access. */
@@ -279,7 +294,8 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
   pi.registerFlag("server-compaction-threshold", { type: "string",
     description: "Server compaction threshold in tokens (>=1000; default: 60% of Pi's trigger)" });
   let override: { enabled: boolean; threshold?: number } | undefined;
-  let pendingNow = false;
+  let pendingNow = false; // Persisted legacy one-shot state, now armed by `next`.
+  let immediateMarker: string | undefined;
   let inTurn = false;
   let compacting = false;
   let attempt: Attempt | undefined;
@@ -319,7 +335,62 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
   pi.on("session_tree", reset);
   pi.on("session_shutdown", () => { attempt = undefined; inTurn = false; warmingModel = undefined; });
   pi.on("turn_start", () => { inTurn = true; attempt = undefined; currentToolNames = undefined; retryEntry = undefined; });
-  pi.on("session_before_compact", () => { compacting = true; attempt = undefined; });
+  pi.on("session_before_compact", async (event, ctx) => {
+    compacting = true;
+    attempt = undefined;
+    if (!immediateMarker || event.reason !== "manual" || event.customInstructions !== immediateMarker) return;
+    const signal = AbortSignal.any([event.signal, AbortSignal.timeout(120_000)]);
+    try {
+      signal.throwIfAborted();
+      if (!supports(ctx.model)) throw new CompactionError("Unsupported compaction route");
+      const model = modelKey(ctx.model);
+      const sessionId = ctx.sessionManager.getSessionId();
+      const leaf = ctx.sessionManager.getLeafId();
+      const projection = ctx.sessionManager.buildSessionProjection();
+      const contextHash = hash(projection.messages);
+      const anchor = [...projection.entries].reverse().find(entry => entry.messages.some(message => message.role !== "system"));
+      const assistant = anchor?.messages.length === 1 ? anchor.messages[0] : undefined;
+      if (!anchor || assistant?.role !== "assistant" || assistant.stopReason !== "stop") {
+        throw new CompactionError("Finish an ordinary assistant response before compacting");
+      }
+      const credential = await identity(ctx);
+      if (!credential) throw new CompactionError("Current OpenAI credentials are unavailable");
+      let payload = await serializedPayload(ctx, convertToLlm(projection.messages));
+      if (!payload || incompatible(payload, true)) throw new CompactionError("Unsupported compaction input");
+      const previous = activeCheckpoint(ctx);
+      if (previous) {
+        if (previous.identity !== credential || previous.model !== ctx.model.id) throw new CompactionError("Checkpoint identity changed");
+        payload = replay(payload, previous, ctx);
+        if (!payload) throw new CompactionError("Existing checkpoint cannot be replayed safely");
+      }
+      payload = hoistEffort(payload);
+      if (!payload || !Array.isArray(payload.input)) throw new CompactionError("Unsupported compaction configuration");
+      const normalized = await serializedAssistant(ctx, assistant);
+      if (!normalized) throw new CompactionError("Cannot verify the retained assistant");
+      const hashes = normalized.map(outputHash).filter((value): value is string => value !== undefined);
+      if (hashes.length === 0) throw new CompactionError("Cannot verify the retained assistant");
+      const result = await requestStandaloneCompaction(ctx, payload.input, signal);
+      signal.throwIfAborted();
+      if (sessionId !== ctx.sessionManager.getSessionId() || leaf !== ctx.sessionManager.getLeafId() ||
+          !ctx.model || modelKey(ctx.model) !== model || credential !== await identity(ctx) ||
+          contextHash !== hash(ctx.sessionManager.buildSessionProjection().messages)) throw new CompactionError("Session changed during compaction");
+      const summary = fallbackSummary(event.branchEntries, ctx);
+      const details: Checkpoint = { kind: KIND, mode: "standalone", model: ctx.model.id, identity: credential,
+        summary, assistantEntryId: anchor.sourceEntry.id, assistantHash: hash(assistant),
+        outputHashes: hashes, replay: result.output };
+      if (bytes(details) > MAX_BYTES) throw new CompactionError("Checkpoint exceeds the safety limit");
+      signal.throwIfAborted();
+      return { compaction: { summary, firstKeptEntryId: anchor.sourceEntry.id,
+        tokensBefore: event.preparation.tokensBefore, details, usage: result.usage } };
+    } catch (error) {
+      // Throwing from a hook would be swallowed by Pi and run its summarizer.
+      // Explicit cancellation is essential: never silently change the operation.
+      if (ctx.hasUI) ctx.ui.notify(signal.aborted
+        ? "Server compaction cancelled or timed out; history is unchanged."
+        : `Immediate server compaction failed${error instanceof CompactionError ? `: ${error.message}` : ""}; history is unchanged. No credential switch or retry was attempted. Use /server-compaction next or Pi's /compact instead.`, "warning");
+      return { cancel: true };
+    }
+  });
   pi.on("session_compact", () => { compacting = false; });
   pi.on("session_compact_failed", () => { compacting = false; });
   pi.on("agent_end", () => { inTurn = false; attempt = undefined; });
@@ -335,20 +406,51 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
     ctx.model && warmingModel === modelKey(ctx.model) ? { action: "stop" } : undefined);
 
   pi.registerCommand("server-compaction", {
-    description: "Server compaction: now (next request), on [token threshold], off, or status (default: on)",
+    description: "Server compaction: now (immediate), next (next request), on [token threshold], off, or status",
     handler: async (args, ctx) => {
       const [action = "status", raw, ...extra] = args.trim() ? args.trim().split(/\s+/) : [];
-      if (!["on", "off", "status", "now"].includes(action) || extra.length > 0 ||
+      if (!["on", "off", "status", "now", "next"].includes(action) || extra.length > 0 ||
           (raw !== undefined && (action !== "on" || !/^\d+$/.test(raw) ||
             !Number.isSafeInteger(Number(raw)) || Number(raw) < MIN_THRESHOLD))) {
-        if (ctx.hasUI) ctx.ui.notify("Use /server-compaction now, on [tokens >=1000], off, or status", "warning");
+        if (ctx.hasUI) ctx.ui.notify("Use /server-compaction now, next, on [tokens >=1000], off, or status", "warning");
         return;
       }
       if (action !== "status") {
+        if (immediateMarker) {
+          if (ctx.hasUI) ctx.ui.notify("Server compaction is already in progress.", "warning");
+          return;
+        }
         await ctx.waitForIdle();
-        if (action === "now") {
+        // Another command may have entered while we were waiting for idle.
+        if (immediateMarker) {
+          if (ctx.hasUI) ctx.ui.notify("Server compaction is already in progress.", "warning");
+          return;
+        }
+        if (action === "now" || action === "next") {
           if (!supports(ctx.model)) {
             if (ctx.hasUI) ctx.ui.notify("Server compaction is unavailable for the current provider/model.", "warning");
+            return;
+          }
+          if (action === "now") {
+            immediateMarker = `${KIND}:immediate:${randomUUID()}`;
+            if (pendingNow) { pi.appendEntry(ONE_SHOT, { pending: false }); pendingNow = false; }
+            if (ctx.hasUI) ctx.ui.notify("Compacting on the server now…", "info");
+            try {
+              await new Promise<void>((resolve) => ctx.compact({
+                customInstructions: immediateMarker,
+                onComplete: () => {
+                  blocked = false;
+                  if (ctx.hasUI) ctx.ui.notify("Server compaction completed and saved.", "info");
+                  resolve();
+                },
+                onError: (error) => {
+                  const reason = ["Already compacted", "Nothing to compact (session too small)"].includes(error.message)
+                    ? ` ${error.message}.` : "";
+                  if (ctx.hasUI) ctx.ui.notify(`Server compaction did not complete; history is unchanged.${reason}`, "warning");
+                  resolve();
+                },
+              }));
+            } finally { immediateMarker = undefined; compacting = false; }
             return;
           }
           pi.appendEntry(ONE_SHOT, { pending: true });
@@ -362,7 +464,7 @@ export function registerAutomaticCompaction(pi: ExtensionAPI): void {
         pendingNow = false;
         blocked = false;
       }
-      const note = (!supports(ctx.model) ? " (unavailable for the current provider/model)"
+      const note = (immediateMarker ? " (immediate compaction in progress)" : !supports(ctx.model) ? " (unavailable for the current provider/model)"
         : blocked ? " (paused after an unsuccessful request)" : "") +
         (pendingNow ? " (one-shot pending for the next eligible request)" : "");
       if (ctx.hasUI) ctx.ui.notify(`Server compaction: ${enabled() ? "on" : "off"}${note}. Public OpenAI Responses only; Pi compaction remains the safety net.`, "info");

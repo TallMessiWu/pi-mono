@@ -5,7 +5,8 @@ Root `AGENTS.md` applies.
 ## Invariants
 
 - Default automatic `context_management` on for eligible requests; preserve explicit off settings and Pi's standard recovery compactor.
-- `/server-compaction now` queues one eligible ordinary request at the minimum threshold without changing the regular configuration. Persist pending/consumed state on the active branch; consume only after compatibility/auth checks. Restore normal settings for tool continuations and after failures/cancellations; explicit `on`/`off` cancels a pending one-shot.
+- `/server-compaction now` immediately requests standalone compaction through Pi's public compaction lifecycle, without an injected conversation turn or standard summarizer fallback. Use only the official public endpoint with the current Pi-resolved API key or OAuth credential; never switch credentials, billing modes, or retry automatically. Bound transport and preserve history on failure/cancellation. Preserve and replay the entire returned window, not just its latest encrypted item, and record standalone usage once.
+- `/server-compaction next` queues one eligible ordinary request at the minimum threshold without changing the regular configuration. Keep existing branch-local pending/consumed entries compatible; consume only after compatibility/auth checks. Restore normal settings for tool continuations and after failures/cancellations; explicit `on`/`off` or immediate `now` cancels a pending one-shot.
 - Enable it only on the official public `openai`/`openai-responses` route for GPT-5/GPT-6 candidates. Do not change providers, credentials, or billing mode.
 - Do not restore legacy backend transport, beta headers, compat serializers, or direct-compaction event-bus adapters.
 - Stop cache warming only when the actual cached request used automatic compaction. Leave unrelated providers and skipped requests unchanged.

@@ -9,8 +9,9 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 ### Added
 
 - Expose only this extension from the fork's root manifest so `git:github.com/TallMessiWu/pi-mono@feat/server-compaction-now` installs independently of a local development clone.
-- Add `/server-compaction now` to queue a temporary 1,000-token threshold for the next eligible ordinary request without sending an extra message or invoking Pi's summarizer. Preserve the original automatic mode and threshold for all subsequent requests, including tool continuations, failures, cancellations, and reloads.
-- Persist branch-local pending/consumed state, show pending one-shots in `status`, and let explicit `on`/`off` cancel them. Cover original settings, checkpoint replay, reload/navigation, skipped requests, failures, cancellations, and the packed extension in print/JSON/RPC modes.
+- Make `/server-compaction now` send one immediate standalone request to the official public `/responses/compact` endpoint through Pi's compaction lifecycle, without injecting a conversation turn or invoking Pi's summarizer. Use the current Pi-resolved API key or ChatGPT OAuth credential without switching authentication or billing modes; account endpoint access remains required and has not been live-verified.
+- Preserve the entire returned context window, including retained items around encrypted checkpoints, and count standalone usage once. Bound transport to 120 seconds and 4 MiB, reject redirects and stale declarations, and leave history unchanged on failures, cancellation, or changed context/credentials. Cover both auth paths, settings, replay/reload, tool continuation, errors and packed print/JSON/RPC modes with mocked transport.
+- Keep the earlier queued operation as `/server-compaction next`: a temporary 1,000-token threshold for the next eligible ordinary request, preserving the original automatic settings. Existing branch-local pending/consumed entries remain compatible; `status` shows pending one-shots, and explicit `on`/`off`/immediate `now` cancel them.
 
 ## [0.2.6] - 2026-11-12
 

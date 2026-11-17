@@ -16,7 +16,10 @@ pi install git:github.com/TallMessiWu/pi-mono@feat/server-compaction-now
 
 Remove any existing npm or local-path installation of pi-codex-compaction first
 so the extension is not loaded twice. Run `/reload` in an existing Pi session,
-then use `/server-compaction now` before sending your next message normally.
+then use `/server-compaction now` to request immediate server compaction, or
+`/server-compaction next` to queue it for your next message. Immediate compaction
+requires the current account to permit OpenAI's standalone compaction endpoint;
+it never switches authentication or billing modes if that endpoint rejects it.
 
 Pi manages its own checkout of the named branch under its Git package directory.
 A separate development clone is not used at runtime: push changes to the branch,

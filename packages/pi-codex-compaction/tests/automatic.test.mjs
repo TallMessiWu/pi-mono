@@ -142,7 +142,7 @@ test("real Pi enables public server compaction by default without a command or s
 });
 
 for (const configuration of ["default", "custom", "off"]) {
-  test(`one-shot now restores ${configuration} settings before tool continuation and after reload`, async t => {
+  test(`one-shot next restores ${configuration} settings before tool continuation and after reload`, async t => {
     const call = { type: "function_call", id: "fc_now", call_id: "call_now", name: "now_fixture",
       arguments: "{}", status: "completed" };
     const requests = mockResponses(t, [[checkpoint(), call], [text("msg_now", "done")], [text("msg_later", "later")]]);
@@ -161,7 +161,7 @@ for (const configuration of ["default", "custom", "off"]) {
     const expected = configuration === "off" ? undefined : [{ type: "compaction", compact_threshold:
       configuration === "custom" ? 20000 : Math.floor((h.model.contextWindow - 8192) * 0.6) }];
 
-    await h.session.prompt("/server-compaction now");
+    await h.session.prompt("/server-compaction next");
     await h.session.prompt("/server-compaction status");
     assert.equal(requests.length, 0, "arming/status must not issue inference or inject a user message");
     assert.deepEqual(configs(), original, "the original config is never replaced by a low threshold");
@@ -185,12 +185,12 @@ for (const configuration of ["default", "custom", "off"]) {
   });
 }
 
-test("pending now survives reload and repeated commands do not stack requests", async t => {
+test("pending next survives reload and repeated commands do not stack requests", async t => {
   const requests = mockResponses(t, [[checkpoint(), text("msg_now", "done")], [text("msg_next", "next")]]);
   const h = await harness({ enabled: null });
   t.after(() => h.close());
-  await h.session.prompt("/server-compaction now");
-  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("/server-compaction next");
+  await h.session.prompt("/server-compaction next");
   await h.session.reload();
   assert.equal(requests.length, 0);
   await h.session.prompt("ordinary message");
@@ -201,7 +201,7 @@ test("pending now survives reload and repeated commands do not stack requests", 
   assert.deepEqual(h.errors, []);
 });
 
-test("an incompatible request leaves now pending until an eligible request", async t => {
+test("an incompatible request leaves next pending until an eligible request", async t => {
   let skip = true;
   const requests = mockResponses(t, [[text("msg_skip", "skipped")], [checkpoint(), text("msg_now", "compacted")],
     [text("msg_after", "normal")]]);
@@ -209,7 +209,7 @@ test("an incompatible request leaves now pending until an eligible request", asy
     pi.on("before_provider_request", event => { if (skip) event.payload.background = true; });
   }] });
   t.after(() => h.close());
-  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("/server-compaction next");
   await h.session.prompt("incompatible request");
   assert.equal(requests[0].context_management, undefined);
   assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, true);
@@ -222,11 +222,11 @@ test("an incompatible request leaves now pending until an eligible request", asy
 });
 
 for (const action of ["on 20000", "off"]) {
-  test(`explicit ${action} cancels a pending now, including across reload`, async t => {
+  test(`explicit ${action} cancels a pending next, including across reload`, async t => {
     const requests = mockResponses(t, [[text("msg_normal", "normal")]]);
     const h = await harness({ enabled: null });
     t.after(() => h.close());
-    await h.session.prompt("/server-compaction now");
+    await h.session.prompt("/server-compaction next");
     await h.session.prompt(`/server-compaction ${action}`);
     await h.session.reload();
     await h.session.prompt("ordinary message");
@@ -245,7 +245,7 @@ test("a failed one-shot is consumed without paid retries and does not change the
   const h = await harness({ enabled: null });
   t.after(() => h.close());
   await h.session.prompt("/server-compaction on 20000");
-  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("/server-compaction next");
   await h.session.prompt("try compaction");
   assert.equal(requests.length, 1, "no separate request or paid retry");
   assert.equal(requests[0].context_management[0].compact_threshold, 1000);
@@ -269,7 +269,7 @@ for (const outcome of ["no-checkpoint", "cancelled"]) {
     })] });
     t.after(() => h.close());
     await h.session.prompt("/server-compaction on 20000");
-    await h.session.prompt("/server-compaction now");
+    await h.session.prompt("/server-compaction next");
     await h.session.prompt("try compaction");
     assert.equal(requests.length, 1);
     assert.equal(requests[0].context_management[0].compact_threshold, 1000);
@@ -282,14 +282,14 @@ for (const outcome of ["no-checkpoint", "cancelled"]) {
   });
 }
 
-test("branch navigation restores pending now only on the selected branch", async t => {
+test("branch navigation restores pending next only on the selected branch", async t => {
   const requests = mockResponses(t, [[text("msg_first", "first")], [text("msg_other", "other branch")],
     [checkpoint(), text("msg_now", "compacted")]]);
   const h = await harness({ enabled: null });
   t.after(() => h.close());
   await h.session.prompt("first message");
   const before = h.manager.getLeafId();
-  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("/server-compaction next");
   const armed = h.manager.getLeafId();
   await h.session.navigateTree(before, { summarize: false });
   await h.session.prompt("abandon pending request");
@@ -297,6 +297,224 @@ test("branch navigation restores pending now only on the selected branch", async
   await h.session.navigateTree(armed, { summarize: false });
   await h.session.prompt("return to armed branch");
   assert.equal(requests[2].context_management[0].compact_threshold, 1000);
+  assert.deepEqual(h.errors, []);
+});
+
+const compactedWindow = () => [
+  { type: "message", role: "user", content: [{ type: "input_text", text: "retained before checkpoint" }] },
+  checkpoint("cmp_immediate"),
+  { type: "message", role: "user", content: [{ type: "input_text", text: "retained after checkpoint" }] },
+];
+const compactResponse = (output = compactedWindow()) => Response.json({
+  object: "response.compaction", id: "resp_compact", output, usage,
+});
+
+for (const authMode of ["api-key", "oauth"]) {
+  for (const configuration of ["default", "custom", "off"]) {
+    test(`now immediately compacts with ${authMode}, preserves ${configuration} settings and the entire window`, async t => {
+      const requests = [];
+      let compactCalls = 0;
+      const h = await harness({ enabled: configuration === "off" ? false : null });
+      t.after(() => h.close());
+      if (authMode === "oauth") {
+        const resolve = h.runtime.getAuth.bind(h.runtime);
+        t.mock.method(h.runtime, "getAuth", async (...args) => {
+          const result = await resolve(...args);
+          return { ...result, auth: { ...result.auth, apiKey: "synthetic-oauth-access", headers: { "ChatGPT-Account-Id": "fixture-account" } } };
+        });
+        t.mock.method(h.runtime, "isUsingOAuth", () => true);
+      }
+      t.mock.method(globalThis, "fetch", async (url, init) => {
+        const body = JSON.parse(init.body);
+        requests.push({ url: String(url), body });
+        if (String(url).endsWith("/compact")) {
+          compactCalls++;
+          const headers = new Headers(init.headers);
+          assert.equal(headers.get("authorization"), `Bearer ${authMode === "oauth" ? "synthetic-oauth-access" : "sk-fixture-not-a-real-key"}`);
+          assert.equal(headers.get("chatgpt-account-id"), authMode === "oauth" ? "fixture-account" : null);
+          assert.equal(init.redirect, "error");
+          assert.deepEqual(Object.keys(body).sort(), ["input", "model"]);
+          assert.ok(body.input.some(i => i.role === "assistant"));
+          assert.ok(!body.input.some(i => i.type === "configuration_update"));
+          return compactResponse();
+        }
+        return response([text(`msg_${requests.length}`, "ordinary answer")], { id: `resp_${requests.length}` });
+      });
+      if (configuration === "custom") await h.session.prompt("/server-compaction on 20000");
+      await h.session.prompt("synthetic old context");
+      const messagesBefore = h.manager.getBranch().filter(e => e.type === "message").length;
+      const configs = () => h.manager.getBranch().filter(e => e.customType === `${kind}:config`).map(e => e.data);
+      const original = structuredClone(configs());
+      await h.session.prompt("/server-compaction now");
+      assert.equal(compactCalls, 1, "command sends a separate request before the next message");
+      assert.equal(requests.length, 2, "serialization cannot issue inference");
+      assert.equal(h.manager.getBranch().filter(e => e.type === "message").length, messagesBefore, "no synthetic conversation turn");
+      const saved = h.manager.getBranch().find(e => e.type === "compaction");
+      assert.equal(saved?.details.mode, "standalone");
+      assert.deepEqual(saved.details.replay, compactedWindow(), "never prune standalone output");
+      assert.equal(saved.usage.totalTokens, 1000, "separate compaction usage is recorded once");
+      assert.doesNotMatch(JSON.stringify(saved), /sk-fixture|synthetic-oauth-access|fixture-account/);
+      assert.deepEqual(configs(), original);
+      await h.session.reload();
+      await h.session.prompt("continue normally");
+      const continued = requests.at(-1).body;
+      const index = continued.input.findIndex(i => i.type === "compaction");
+      assert.deepEqual(continued.input.slice(index - 1, index + 2), compactedWindow());
+      assert.doesNotMatch(JSON.stringify(continued.input), /synthetic old context|ordinary answer/);
+      assert.deepEqual(continued.context_management, configuration === "off" ? undefined : [{ type: "compaction",
+        compact_threshold: configuration === "custom" ? 20000 : Math.floor((h.model.contextWindow - 8192) * 0.6) }]);
+      assert.equal(h.session.getSessionStats().tokens.total, 3000);
+      assert.deepEqual(configs(), original);
+      assert.deepEqual(h.errors, []);
+    });
+  }
+}
+
+for (const failure of ["http", "network", "malformed", "oversized", "declarations", "cancelled", "changed-context", "changed-credential"]) {
+  test(`immediate ${failure} preserves history without a summarizer, credential fallback or retry`, async t => {
+    const requests = [];
+    let h;
+    t.mock.method(globalThis, "fetch", async (url) => {
+      requests.push(String(url));
+      if (!String(url).endsWith("/compact")) return response([text("msg_old", "old answer")]);
+      switch (failure) {
+        case "http": return new Response("SECRET_ECHO", { status: 403 });
+        case "network": throw new Error("SECRET_ECHO");
+        case "malformed": return Response.json({ object: "response.compaction", id: "bad", output: [text("msg_bad", "no checkpoint")], usage });
+        case "oversized": return new Response("x".repeat(4 * 1024 * 1024 + 1));
+        case "declarations": return compactResponse([...compactedWindow(), { type: "additional_tools", tools: [] }]);
+        case "cancelled": h.session.abortCompaction(); break;
+        case "changed-context": h.manager.appendContextEdit(h.manager.getBranch().find(e => e.type === "message" && e.message.role === "assistant").id, { content: "redacted" }); break;
+        case "changed-credential": await h.credentials.modify("openai", async () => ({ type: "api_key", key: "sk-rotated" })); break;
+      }
+      return compactResponse();
+    });
+    h = await harness({ enabled: false });
+    t.after(() => h.close());
+    await h.session.prompt("old context");
+    const before = h.manager.getBranch().filter(e => e.type === "message");
+    await h.session.prompt("/server-compaction now");
+    assert.equal(requests.length, 2);
+    assert.equal(h.manager.getBranch().some(e => e.type === "compaction"), false);
+    assert.deepEqual(h.manager.getBranch().filter(e => e.type === "message"), before);
+    assert.deepEqual(h.errors, []);
+  });
+}
+
+test("immediate compaction replays an existing automatic checkpoint and preserves subsequent tool continuations", async t => {
+  const requests = [];
+  let ordinary = 0;
+  const call = { type: "function_call", id: "fc_manual", call_id: "manual_tool", name: "manual_fixture", arguments: "{}", status: "completed" };
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url: String(url), body });
+    if (String(url).endsWith("/compact")) {
+      assert.deepEqual(body.input.find(i => i.type === "compaction"), checkpoint("cmp_before"));
+      assert.doesNotMatch(JSON.stringify(body.input), /Provider checkpoint;/);
+      return compactResponse();
+    }
+    ordinary++;
+    return response(ordinary === 1 ? [checkpoint("cmp_before"), text("msg_first", "first")]
+      : ordinary === 2 ? [text("msg_second", "second")] : ordinary === 3 ? [call] : [text("msg_done", "done")], { id: `resp_${ordinary}` });
+  });
+  const h = await harness({ factories: [pi => pi.registerTool({ name: "manual_fixture", label: "Manual fixture", description: "Synthetic tool",
+    parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "tool success" }], details: undefined }; },
+  })] });
+  t.after(() => h.close());
+  await h.session.prompt("first");
+  await h.session.prompt("new context after the automatic checkpoint");
+  await h.session.prompt("/server-compaction now");
+  assert.equal(h.manager.getBranch().filter(e => e.type === "compaction").length, 2);
+  await h.session.prompt("call manual_fixture");
+  assert.equal(requests.length, 5);
+  assert.ok(requests[3].body.input.some(i => i.id === "cmp_immediate"));
+  assert.ok(requests[4].body.input.some(i => i.id === "cmp_immediate"));
+  assert.equal(requests[4].body.input.find(i => i.type === "function_call_output").output, "tool success");
+  assert.deepEqual(h.errors, []);
+});
+
+test("concurrent now commands do not override the compaction hook marker or run a summarizer", async t => {
+  let compactCalls = 0;
+  let ordinaryCalls = 0;
+  t.mock.method(globalThis, "fetch", async (url) => {
+    if (String(url).endsWith("/compact")) { compactCalls++; return compactResponse(); }
+    ordinaryCalls++;
+    return response([text("msg_concurrent", "original answer")]);
+  });
+  const h = await harness({ enabled: false });
+  t.after(() => h.close());
+  await h.session.prompt("original context");
+  await Promise.all([h.session.prompt("/server-compaction now"), h.session.prompt("/server-compaction now")]);
+  assert.equal(compactCalls, 1);
+  assert.equal(ordinaryCalls, 1);
+  assert.equal(h.manager.getBranch().filter(e => e.type === "compaction").length, 1);
+  assert.deepEqual(h.errors, []);
+});
+
+test("small sessions and pre-cancelled immediate operations do not send requests", async t => {
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => { requests++; return response([text("msg_small", "short")]); });
+  const h = await harness({ enabled: false, settings: { compaction: { enabled: false, keepRecentTokens: 20000 } } });
+  t.after(() => h.close());
+  await h.session.prompt("/server-compaction now");
+  assert.equal(requests, 0);
+  await h.session.prompt("short context");
+  await h.session.prompt("/server-compaction now");
+  assert.equal(requests, 1, "Pi's small-session preparation prevents transport");
+  const other = await harness({ enabled: false });
+  t.after(() => other.close());
+  await other.session.prompt("old context");
+  t.mock.method(AbortSignal, "timeout", () => AbortSignal.abort());
+  await other.session.prompt("/server-compaction now");
+  assert.equal(requests, 2, "deadline/cancellation before preparation prevents I/O");
+  assert.equal(other.manager.getBranch().some(e => e.type === "compaction"), false);
+  assert.deepEqual([...h.errors, ...other.errors], []);
+});
+
+test("immediate checkpoints remain branch-local and edited anchors prevent opaque replay", async t => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push(JSON.parse(init.body));
+    return String(url).endsWith("/compact") ? compactResponse() : response([text(`msg_branch_${requests.length}`, "answer")], { id: `resp_${requests.length}` });
+  });
+  const h = await harness({ enabled: false });
+  t.after(() => h.close());
+  await h.session.prompt("original branch context");
+  const before = h.manager.getLeafId();
+  await h.session.prompt("/server-compaction next");
+  await h.session.prompt("/server-compaction now");
+  assert.equal(h.manager.getBranch().filter(e => e.customType === `${kind}:now`).at(-1).data.pending, false);
+  const compacted = h.manager.getLeafId();
+  await h.session.navigateTree(before, { summarize: false });
+  await h.session.prompt("different branch");
+  assert.equal(requests.at(-1).input.some(i => i.type === "compaction"), false);
+  assert.match(JSON.stringify(requests.at(-1).input), /original branch context/);
+  await h.session.navigateTree(compacted, { summarize: false });
+  await h.session.prompt("back to compacted branch");
+  assert.deepEqual(requests.at(-1).input.find(i => i.type === "compaction"), checkpoint("cmp_immediate"));
+  const anchor = h.manager.getBranch().find(e => e.type === "compaction").details.assistantEntryId;
+  h.manager.appendContextEdit(anchor, { content: "changed anchor" });
+  await h.session.prompt("after edit");
+  assert.equal(requests.at(-1).input.some(i => i.type === "compaction"), false);
+  assert.match(JSON.stringify(requests.at(-1).input), /changed anchor/);
+  assert.deepEqual(h.errors, []);
+});
+
+test("ordinary Pi compaction still uses its standard summarizer after now", async t => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    requests.push(String(url));
+    return String(url).endsWith("/compact") ? compactResponse() : response([text(`msg_${requests.length}`, "a standard summary")], { id: `resp_${requests.length}` });
+  });
+  const h = await harness({ enabled: false });
+  t.after(() => h.close());
+  await h.session.prompt("first");
+  await h.session.prompt("/server-compaction now");
+  await h.session.prompt("another message");
+  await h.session.compact("Keep the important facts");
+  assert.equal(requests.filter(url => url.endsWith("/compact")).length, 1);
+  assert.equal(h.manager.getBranch().filter(e => e.type === "compaction").length, 2);
   assert.deepEqual(h.errors, []);
 });
 
